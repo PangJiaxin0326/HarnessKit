@@ -1,2 +1,1 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
+/// HarnessKit provides filesystem-backed primitives for AI harness engineering.
