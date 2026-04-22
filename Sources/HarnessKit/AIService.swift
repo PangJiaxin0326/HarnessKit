@@ -477,25 +477,24 @@ public actor AIService {
     }
 
     public func generate(_ input: String) async throws -> String {
-        let execution = try await prepareExecution(for: input)
-
         do {
+            let execution = try await prepareExecution(for: input)
             let output = try await configuration.backend.provider.generate(execution.request)
             return try await finalize(output: output, execution: execution)
         } catch {
-            if error is CancellationError {
-                statusValue = .idle
-                throw error
-            }
-
-            statusValue = .idle
-            await configuration.observer.record(.init(kind: .failed, message: error.localizedDescription))
+            await handleExecutionFailure(error)
             throw error
         }
     }
 
     public func stream(_ input: String) async throws -> AsyncThrowingStream<Generation, Error> {
-        let execution = try await prepareExecution(for: input)
+        let execution: PreparedExecution
+        do {
+            execution = try await prepareExecution(for: input)
+        } catch {
+            await handleExecutionFailure(error)
+            throw error
+        }
         let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
 
         let worker = Task {
@@ -522,8 +521,7 @@ public actor AIService {
                 }
                 continuation.finish()
             } catch {
-                statusValue = .idle
-                await configuration.observer.record(.init(kind: .failed, message: error.localizedDescription))
+                await handleExecutionFailure(error)
                 continuation.finish(throwing: error)
             }
         }
@@ -533,6 +531,25 @@ public actor AIService {
         }
 
         return stream
+    }
+
+    private func handleExecutionFailure(_ error: Error) async {
+        if error is CancellationError {
+            statusValue = .idle
+            return
+        }
+
+        if let harnessError = error as? HarnessError {
+            switch harnessError {
+            case .permissionDenied, .governanceBlocked:
+                return
+            case .missingTool, .invalidSkillFile, .invalidSubagent, .missingSubagent:
+                break
+            }
+        }
+
+        statusValue = .idle
+        await configuration.observer.record(.init(kind: .failed, message: error.localizedDescription))
     }
 
     private func prepareExecution(for input: String) async throws -> PreparedExecution {

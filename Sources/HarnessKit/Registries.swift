@@ -56,12 +56,14 @@ public actor HarnessSkillRegistry {
             relativeTo: workspace.rootURL
         )
         let allURLs = registeredURLs.union(agentURLs.map(\.standardizedFileURL))
+        var refreshedHeaders: [URL: HarnessSkillHeader] = [:]
 
         for url in allURLs {
             let document = try MarkdownSkillParser.parseSkill(at: url)
-            headersByURL[url] = document.header
+            refreshedHeaders[url] = document.header
         }
 
+        headersByURL = refreshedHeaders
         return headers()
     }
 

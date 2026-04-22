@@ -169,6 +169,98 @@ func streamCachesChunkedOutput() async throws {
     #expect(rawOutput == "Hello, world")
 }
 
+@Test
+func generateResetsStatusAndRecordsFailureWhenPreparationFails() async throws {
+    let workspace = try makeWorkspace(named: "prepare-failure")
+    defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
+
+    let observer = HarnessTranscriptObserver()
+    let service = try AIService(configuration: .init(
+        backend: .custom(ClosureAIModelProvider { _ in "unused" }),
+        workspace: workspace,
+        contextBuilder: FailingContextBuilder(),
+        observer: observer
+    ))
+
+    var didThrowExpectedError = false
+    do {
+        _ = try await service.generate("Build a harness response.")
+    } catch is IntentionalFailure {
+        didThrowExpectedError = true
+    }
+
+    #expect(didThrowExpectedError)
+    #expect(await service.status == .idle)
+
+    let failedEvents = await observer.allEvents().filter { $0.kind == .failed }
+    #expect(failedEvents.count == 1)
+}
+
+@Test
+func generateKeepsWaitingStatusWhenGovernanceBlocksCompletion() async throws {
+    let workspace = try makeWorkspace(named: "governance-failure")
+    defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
+
+    let observer = HarnessTranscriptObserver()
+    let service = try AIService(configuration: .init(
+        backend: .custom(ClosureAIModelProvider { _ in "completed" }),
+        workspace: workspace,
+        observer: observer,
+        governor: BlockingGovernor()
+    ))
+
+    var didThrowGovernanceError = false
+    do {
+        _ = try await service.generate("Build a harness response.")
+    } catch let error as HarnessError {
+        if case .governanceBlocked("Human review required.") = error {
+            didThrowGovernanceError = true
+        }
+    }
+
+    #expect(didThrowGovernanceError)
+    #expect(await service.status == .waiting)
+
+    let failedEvents = await observer.allEvents().filter { $0.kind == .failed }
+    #expect(failedEvents.count == 1)
+}
+
+@Test
+func skillHeadersRefreshDropsSkillsRemovedFromAgentsFile() async throws {
+    let workspace = try makeWorkspace(named: "agents-refresh")
+    defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
+
+    let skillURL = workspace.skillsDirectoryURL.appendingPathComponent("summarize.md", isDirectory: false)
+    try """
+    ---
+    name: summarize
+    description: Summarizes large documents.
+    ---
+
+    # summarize
+    """.write(to: skillURL, atomically: true, encoding: .utf8)
+
+    try """
+    # AGENTS
+    - [summarize](Skills/summarize.md)
+    """.write(to: workspace.agentsFileURL, atomically: true, encoding: .utf8)
+
+    let service = try AIService(configuration: .init(
+        backend: .custom(ClosureAIModelProvider { _ in "unused" }),
+        workspace: workspace
+    ))
+
+    let initialHeaders = try await service.skillHeaders()
+    #expect(initialHeaders.map(\.name) == ["summarize"])
+
+    try """
+    # AGENTS
+    """.write(to: workspace.agentsFileURL, atomically: true, encoding: .utf8)
+
+    let refreshedHeaders = try await service.skillHeaders()
+    #expect(refreshedHeaders.isEmpty)
+}
+
 private func makeWorkspace(named name: String) throws -> HarnessWorkspace {
     let rootURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("HarnessKitTests-\(name)-\(UUID().uuidString)", isDirectory: true)
@@ -179,3 +271,26 @@ private func makeWorkspace(named name: String) throws -> HarnessWorkspace {
     try FileManager.default.createDirectory(at: workspace.agentsDirectoryURL, withIntermediateDirectories: true)
     return workspace
 }
+
+private struct FailingContextBuilder: HarnessContextBuilding {
+    func buildContext(
+        for input: String,
+        intent: HarnessIntent,
+        environment: HarnessEnvironmentSnapshot
+    ) async throws -> HarnessContext {
+        _ = (input, intent, environment)
+        throw IntentionalFailure()
+    }
+}
+
+private struct BlockingGovernor: HarnessGoverning {
+    func decide(
+        verification: HarnessVerification,
+        evaluation: HarnessEvaluation
+    ) async -> HarnessGovernanceDecision {
+        _ = (verification, evaluation)
+        return .fail(reason: "Human review required.")
+    }
+}
+
+private struct IntentionalFailure: Error {}
