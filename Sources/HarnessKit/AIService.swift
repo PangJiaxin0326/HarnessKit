@@ -173,6 +173,18 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
             ? "- No memory files."
             : environment.memoryFiles.map { "- \($0.url.path)" }.joined(separator: "\n")
 
+        let toolCallInstructions = environment.toolDescriptors.isEmpty ? "" : """
+
+        Tool Calling Protocol
+        - If a registered tool is needed, respond with only this block and no other text:
+          <tool_call>
+          {"name":"tool-name","input":"plain text or JSON string input"}
+          </tool_call>
+        - Request one tool at a time.
+        - Do not wrap the tool call block in Markdown code fences.
+        - After the harness returns a tool result, either request another tool with the same format or answer the user directly.
+        """
+
         let prompt = """
         You are operating inside an AI harness.
 
@@ -187,6 +199,7 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
 
         Registered Tools
         \(toolLines)
+        \(toolCallInstructions)
 
         Skill Headers
         \(skillLines)
@@ -343,6 +356,26 @@ public actor AIService {
         let environment: HarnessEnvironmentSnapshot
     }
 
+    private struct AutomaticToolCall: Sendable {
+        let name: String
+        let input: String
+    }
+
+    private struct AutomaticToolResult: Sendable {
+        let call: AutomaticToolCall
+        let output: String
+        let wasSuccessful: Bool
+    }
+
+    private enum StreamPassOutcome: Sendable {
+        case final(String)
+        case toolCall(AutomaticToolCall)
+    }
+
+    private static let automaticToolCallStartTag = "<tool_call>"
+    private static let automaticToolCallEndTag = "</tool_call>"
+    private static let maximumAutomaticToolRoundTrips = 8
+
     private let configuration: Configuration
     private let toolRegistry: HarnessToolRegistry
     private let skillRegistry: HarnessSkillRegistry
@@ -479,7 +512,7 @@ public actor AIService {
     public func generate(_ input: String) async throws -> String {
         do {
             let execution = try await prepareExecution(for: input)
-            let output = try await configuration.backend.provider.generate(execution.request)
+            let output = try await runGenerateLoop(for: execution)
             return try await finalize(output: output, execution: execution)
         } catch {
             await handleExecutionFailure(error)
@@ -498,23 +531,8 @@ public actor AIService {
         let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
 
         let worker = Task {
-            var output = ""
             do {
-                let providerStream = configuration.backend.provider.stream(execution.request)
-                for try await generation in providerStream {
-                    switch generation.kind {
-                    case .delta:
-                        output += generation.text
-                    case .completed:
-                        if output.isEmpty {
-                            output = generation.text
-                        }
-                    case .metadata:
-                        break
-                    }
-                    continuation.yield(generation)
-                }
-
+                let output = try await runStreamLoop(for: execution, continuation: continuation)
                 let finalizedOutput = try await finalize(output: output, execution: execution)
                 if output.isEmpty {
                     continuation.yield(Generation(kind: .completed, text: finalizedOutput))
@@ -593,6 +611,7 @@ public actor AIService {
         let cacheRecord = try await cache.createRecord(
             rawInput: input,
             processedContext: context.rendered,
+            providerPrompt: plan.prompt,
             metadata: metadata
         )
         await configuration.observer.record(.init(kind: .cached, message: "Saved harness cache '\(metadata.id.uuidString)'."))
@@ -635,7 +654,7 @@ public actor AIService {
 
         switch governanceDecision {
         case .finish:
-            statusValue = .waiting
+            statusValue = .idle
             await configuration.observer.record(.init(kind: .completed, message: "Harness execution completed."))
             return output
         case .wait(let reason):
@@ -670,5 +689,267 @@ public actor AIService {
             subagents: subagents,
             agentsFileText: agentsFileText
         )
+    }
+
+    private func runGenerateLoop(for execution: PreparedExecution) async throws -> String {
+        var request = execution.request
+        var toolRoundTripCount = 0
+
+        while true {
+            try Task.checkCancellation()
+            try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
+
+            let output = try await configuration.backend.provider.generate(request)
+            guard let toolCall = automaticToolCall(in: output) else {
+                return output
+            }
+
+            toolRoundTripCount += 1
+            let canRequestMoreTools = toolRoundTripCount < Self.maximumAutomaticToolRoundTrips
+            let toolResult = await invokeAutomaticTool(toolCall)
+            request = requestByAppendingToolResult(
+                toolResult,
+                to: request,
+                roundTrip: toolRoundTripCount,
+                canRequestMoreTools: canRequestMoreTools
+            )
+
+            if !canRequestMoreTools {
+                try Task.checkCancellation()
+                try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
+                return try await configuration.backend.provider.generate(request)
+            }
+        }
+    }
+
+    private func runStreamLoop(
+        for execution: PreparedExecution,
+        continuation: AsyncThrowingStream<Generation, Error>.Continuation
+    ) async throws -> String {
+        var request = execution.request
+        var toolRoundTripCount = 0
+
+        while true {
+            try Task.checkCancellation()
+            try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
+
+            let outcome = try await collectProviderStream(for: request, continuation: continuation)
+            switch outcome {
+            case .final(let output):
+                return output
+            case .toolCall(let toolCall):
+                toolRoundTripCount += 1
+                let canRequestMoreTools = toolRoundTripCount < Self.maximumAutomaticToolRoundTrips
+                let toolResult = await invokeAutomaticTool(toolCall)
+                request = requestByAppendingToolResult(
+                    toolResult,
+                    to: request,
+                    roundTrip: toolRoundTripCount,
+                    canRequestMoreTools: canRequestMoreTools
+                )
+
+                if !canRequestMoreTools {
+                    try Task.checkCancellation()
+                    try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
+                    return try await streamFinalAnswer(for: request, continuation: continuation)
+                }
+            }
+        }
+    }
+
+    private func streamFinalAnswer(
+        for request: AIModelRequest,
+        continuation: AsyncThrowingStream<Generation, Error>.Continuation
+    ) async throws -> String {
+        var output = ""
+
+        for try await generation in configuration.backend.provider.stream(request) {
+            switch generation.kind {
+            case .delta:
+                output += generation.text
+            case .completed:
+                if output.isEmpty {
+                    output = generation.text
+                }
+            case .metadata:
+                break
+            }
+
+            continuation.yield(generation)
+        }
+
+        return output
+    }
+
+    private func collectProviderStream(
+        for request: AIModelRequest,
+        continuation: AsyncThrowingStream<Generation, Error>.Continuation
+    ) async throws -> StreamPassOutcome {
+        let shouldBufferForToolCalls = !request.tools.isEmpty
+        var output = ""
+        var bufferedGenerations: [Generation] = []
+        var isBuffering = shouldBufferForToolCalls
+
+        for try await generation in configuration.backend.provider.stream(request) {
+            switch generation.kind {
+            case .delta:
+                output += generation.text
+            case .completed:
+                if output.isEmpty {
+                    output = generation.text
+                }
+            case .metadata:
+                break
+            }
+
+            if isBuffering {
+                bufferedGenerations.append(generation)
+                if !outputMayStillBecomeAutomaticToolCall(output) {
+                    for bufferedGeneration in bufferedGenerations {
+                        continuation.yield(bufferedGeneration)
+                    }
+                    bufferedGenerations.removeAll(keepingCapacity: true)
+                    isBuffering = false
+                }
+            } else {
+                continuation.yield(generation)
+            }
+        }
+
+        if isBuffering, let toolCall = automaticToolCall(in: output) {
+            return .toolCall(toolCall)
+        }
+
+        for bufferedGeneration in bufferedGenerations {
+            continuation.yield(bufferedGeneration)
+        }
+        return .final(output)
+    }
+
+    private func invokeAutomaticTool(_ toolCall: AutomaticToolCall) async -> AutomaticToolResult {
+        do {
+            let output = try await toolRegistry.invoke(named: toolCall.name, input: toolCall.input)
+            return AutomaticToolResult(call: toolCall, output: output, wasSuccessful: true)
+        } catch {
+            return AutomaticToolResult(call: toolCall, output: error.localizedDescription, wasSuccessful: false)
+        }
+    }
+
+    private func requestByAppendingToolResult(
+        _ toolResult: AutomaticToolResult,
+        to request: AIModelRequest,
+        roundTrip: Int,
+        canRequestMoreTools: Bool
+    ) -> AIModelRequest {
+        var updatedRequest = request
+        let nextStepInstructions = canRequestMoreTools
+            ? """
+            - If another registered tool is needed, respond with only a new `<tool_call>` block.
+            - Otherwise answer the user directly.
+            """
+            : "- The harness will not run more tools in this turn, so answer the user directly with the information you already have."
+
+        updatedRequest.prompt += """
+
+        Harness Tool Round Trip \(roundTrip)
+        Requested Tool
+        - Name: \(toolResult.call.name)
+        - Status: \(toolResult.wasSuccessful ? "success" : "failure")
+
+        Tool Input
+        \(toolResult.call.input)
+
+        Tool Result
+        \(toolResult.output)
+
+        Next Step
+        \(nextStepInstructions)
+        """
+        return updatedRequest
+    }
+
+    private func automaticToolCall(in output: String) -> AutomaticToolCall? {
+        let normalizedOutput = strippedEnclosingCodeFence(from: output)
+        guard
+            let startRange = normalizedOutput.range(of: Self.automaticToolCallStartTag),
+            let endRange = normalizedOutput.range(of: Self.automaticToolCallEndTag),
+            startRange.lowerBound < endRange.lowerBound
+        else {
+            return nil
+        }
+
+        let prefix = normalizedOutput[..<startRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = normalizedOutput[endRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard prefix.isEmpty, suffix.isEmpty else {
+            return nil
+        }
+
+        let payload = normalizedOutput[startRange.upperBound..<endRange.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            let payloadData = payload.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: payloadData),
+            let dictionary = object as? [String: Any]
+        else {
+            return nil
+        }
+
+        let rawName = dictionary["name"] as? String ?? dictionary["tool"] as? String
+        let name = rawName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !name.isEmpty else {
+            return nil
+        }
+
+        return AutomaticToolCall(
+            name: name,
+            input: stringValue(forToolPayload: dictionary["input"] ?? dictionary["arguments"])
+        )
+    }
+
+    private func outputMayStillBecomeAutomaticToolCall(_ output: String) -> Bool {
+        let candidate = output.drop(while: \.isWhitespace)
+        guard !candidate.isEmpty else {
+            return true
+        }
+
+        let marker = Self.automaticToolCallStartTag[...]
+        return marker.hasPrefix(candidate) || candidate.hasPrefix(marker)
+    }
+
+    private func strippedEnclosingCodeFence(from text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("```"), trimmed.hasSuffix("```") else {
+            return trimmed
+        }
+
+        let lines = trimmed.components(separatedBy: .newlines)
+        guard
+            lines.count >= 2,
+            lines.first?.hasPrefix("```") == true,
+            lines.last == "```"
+        else {
+            return trimmed
+        }
+
+        return lines.dropFirst().dropLast().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func stringValue(forToolPayload value: Any?) -> String {
+        switch value {
+        case nil:
+            return ""
+        case let string as String:
+            return string
+        default:
+            guard
+                let value,
+                JSONSerialization.isValidJSONObject(value),
+                let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+                let string = String(data: data, encoding: .utf8)
+            else {
+                return String(describing: value as Any)
+            }
+            return string
+        }
     }
 }

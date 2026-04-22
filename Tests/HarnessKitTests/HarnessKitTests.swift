@@ -60,15 +60,125 @@ func generateLoadsAgentsSkillsAndWritesCache() async throws {
 
     let rawInput = try String(contentsOf: records[0].rawInputURL, encoding: .utf8)
     let processedContext = try String(contentsOf: records[0].processedContextURL, encoding: .utf8)
+    let providerPrompt = try String(contentsOf: records[0].providerPromptURL, encoding: .utf8)
     #expect(rawInput == "Build a harness response.")
     #expect(processedContext.contains("Skill Header: summarize"))
     #expect(processedContext.contains("repo-map.md"))
+    #expect(providerPrompt.contains("Tool Calling Protocol"))
+    #expect(providerPrompt.contains("Build a harness response."))
 
-    let status = await service.status
-    #expect(status == .waiting)
-    await service.acknowledgeWaitState()
-    let idleStatus = await service.status
-    #expect(idleStatus == .idle)
+    #expect(await service.status == .idle)
+}
+
+@Test
+func generateRunsAutomaticToolRoundTripAndCachesFinalProviderPrompt() async throws {
+    let workspace = try makeWorkspace(named: "generate-tool-loop")
+    defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
+
+    let requestRecorder = RequestRecorder()
+    let provider = ClosureAIModelProvider { request in
+        let callCount = await requestRecorder.record(request)
+        if callCount == 1 {
+            return """
+            <tool_call>
+            {"name":"add-numbers","input":"3, 4, 5"}
+            </tool_call>
+            """
+        }
+
+        return "The sum is 12."
+    }
+
+    let service = try AIService(configuration: .init(
+        backend: .custom(provider),
+        workspace: workspace
+    ))
+    await service.registerTool(HarnessTool(name: "add-numbers", description: "Adds comma-separated integers.") { input in
+        let parts = input.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        return String(parts.reduce(0, +))
+    })
+
+    let output = try await service.generate("What is 3 + 4 + 5?")
+    #expect(output == "The sum is 12.")
+    #expect(await service.status == .idle)
+
+    let requests = await requestRecorder.allRequests()
+    #expect(requests.count == 2)
+    #expect(requests[0].prompt.contains("Tool Calling Protocol"))
+    #expect(requests[1].prompt.contains("Harness Tool Round Trip 1"))
+    #expect(requests[1].prompt.contains("Name: add-numbers"))
+    #expect(requests[1].prompt.contains("Status: success"))
+    #expect(requests[1].prompt.contains("Tool Result\n12"))
+
+    let records = try await service.cacheRecords()
+    #expect(records.count == 1)
+    let providerPrompt = try String(contentsOf: records[0].providerPromptURL, encoding: .utf8)
+    #expect(providerPrompt == requests[1].prompt)
+}
+
+@Test
+func streamRunsAutomaticToolRoundTripBeforeYieldingFinalAnswer() async throws {
+    let workspace = try makeWorkspace(named: "stream-tool-loop")
+    defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
+
+    let requestRecorder = RequestRecorder()
+    let provider = ClosureAIModelProvider(
+        generate: { _ in "unused" },
+        stream: { request in
+            let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
+            let worker = Task {
+                let callCount = await requestRecorder.record(request)
+                if callCount == 1 {
+                    continuation.yield(Generation(kind: .delta, text: "<tool_call>"))
+                    continuation.yield(Generation(kind: .delta, text: "{\"name\":\"add-numbers\",\"input\":\"2, 3, 4\"}"))
+                    continuation.yield(Generation(kind: .delta, text: "</tool_call>"))
+                } else {
+                    continuation.yield(Generation(kind: .delta, text: "The sum "))
+                    continuation.yield(Generation(kind: .delta, text: "is 9."))
+                }
+                continuation.finish()
+            }
+
+            continuation.onTermination = { _ in
+                worker.cancel()
+            }
+
+            return stream
+        }
+    )
+
+    let service = try AIService(configuration: .init(
+        backend: .custom(provider),
+        workspace: workspace
+    ))
+    await service.registerTool(HarnessTool(name: "add-numbers", description: "Adds comma-separated integers.") { input in
+        let parts = input.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        return String(parts.reduce(0, +))
+    })
+
+    let stream = try await service.stream("What is 2 + 3 + 4?")
+    var collected: [Generation] = []
+    for try await generation in stream {
+        collected.append(generation)
+    }
+
+    let visibleText = collected
+        .filter { $0.kind != .metadata }
+        .map(\.text)
+        .joined()
+    #expect(visibleText == "The sum is 9.")
+    #expect(!visibleText.contains("<tool_call>"))
+    #expect(await service.status == .idle)
+
+    let requests = await requestRecorder.allRequests()
+    #expect(requests.count == 2)
+    #expect(requests[1].prompt.contains("Tool Result\n9"))
+
+    let records = try await service.cacheRecords()
+    let providerPrompt = try String(contentsOf: records[0].providerPromptURL, encoding: .utf8)
+    let rawOutput = try String(contentsOf: records[0].rawOutputURL, encoding: .utf8)
+    #expect(providerPrompt == requests[1].prompt)
+    #expect(rawOutput == "The sum is 9.")
 }
 
 @Test
@@ -290,6 +400,19 @@ private struct BlockingGovernor: HarnessGoverning {
     ) async -> HarnessGovernanceDecision {
         _ = (verification, evaluation)
         return .fail(reason: "Human review required.")
+    }
+}
+
+private actor RequestRecorder {
+    private var requests: [AIModelRequest] = []
+
+    func record(_ request: AIModelRequest) -> Int {
+        requests.append(request)
+        return requests.count
+    }
+
+    func allRequests() -> [AIModelRequest] {
+        requests
     }
 }
 

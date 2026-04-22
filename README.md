@@ -33,6 +33,7 @@ The harness work happens behind that interface. Developers configure tools, skil
 - A filesystem-backed cache that stores:
   - raw input
   - processed context
+  - the provider prompt
   - raw model output
   - metadata
 - A filesystem-backed subagent model under `agents/`
@@ -107,10 +108,11 @@ The default harness will:
 3. Load skill headers referenced by `AGENTS.md`
 4. Load memory files from the configured memory directory
 5. Build processed context
-6. Store raw input and processed context in the on-disk cache
+6. Store raw input, processed context, and the provider prompt in the on-disk cache
 7. Call the configured provider
-8. Store the raw output in the cache
-9. Move into `waiting` status until the caller acknowledges the result
+8. Automatically round-trip through registered tools when the model emits a `<tool_call>` request
+9. Store the raw output in the cache
+10. Return to `idle` after successful completion, or move into `waiting` when the harness needs more caller action
 
 If you want the compact `String -> String` mental model, you can also use:
 
@@ -155,6 +157,16 @@ await service.registerTool(HarnessTool(
 ```
 
 You can also use `HarnessToolRegistry` directly if you want a standalone registry outside `AIService`.
+
+When tools are registered, the default workflow also teaches the model a small text protocol for automatic tool use. A compliant model can respond with:
+
+```text
+<tool_call>
+{"name":"read-file","input":"README.md"}
+</tool_call>
+```
+
+`AIService` will invoke the tool, append the result to the provider prompt, and continue until the model returns a normal answer.
 
 ### Skills
 
@@ -217,11 +229,12 @@ Each harness run creates a cache directory under `.harness-cache/<uuid>/` contai
 ```text
 raw-input.txt
 processed-context.md
+provider-prompt.md
 raw-output.txt
 metadata.json
 ```
 
-This is intended to preserve both the raw text and the processed context used to build the final request.
+This is intended to preserve the raw text, the processed context, and the latest provider prompt that was actually sent during the run.
 
 ## Subagents
 
@@ -269,7 +282,7 @@ let updated = try await service.updateSubagentOutput(
 - `working`
 - `waiting`
 
-`waiting` is used when the harness is waiting for the caller to provide more context or to consume and acknowledge a result.
+`waiting` is used when the harness is waiting for the caller to provide more context or when governance blocks automatic completion. Successful runs return to `idle`.
 
 ## Customizing the Harness
 

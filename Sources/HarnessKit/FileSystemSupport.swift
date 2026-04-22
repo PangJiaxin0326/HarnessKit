@@ -311,17 +311,20 @@ public actor FileSystemHarnessCache: HarnessCaching {
     public func createRecord(
         rawInput: String,
         processedContext: String,
+        providerPrompt: String,
         metadata: HarnessCacheMetadata
     ) async throws -> HarnessCacheRecord {
         let directoryURL = rootDirectoryURL.appendingPathComponent(metadata.id.uuidString, isDirectory: true)
         let rawInputURL = directoryURL.appendingPathComponent("raw-input.txt", isDirectory: false)
         let processedContextURL = directoryURL.appendingPathComponent("processed-context.md", isDirectory: false)
+        let providerPromptURL = directoryURL.appendingPathComponent("provider-prompt.md", isDirectory: false)
         let rawOutputURL = directoryURL.appendingPathComponent("raw-output.txt", isDirectory: false)
         let metadataURL = directoryURL.appendingPathComponent("metadata.json", isDirectory: false)
 
         try FileSystemUtilities.ensureDirectory(directoryURL)
         try FileSystemUtilities.write(rawInput, to: rawInputURL)
         try FileSystemUtilities.write(processedContext, to: processedContextURL)
+        try FileSystemUtilities.write(providerPrompt, to: providerPromptURL)
         FileManager.default.createFile(atPath: rawOutputURL.path, contents: Data())
         try encoder.encode(metadata).write(to: metadataURL)
 
@@ -330,9 +333,17 @@ public actor FileSystemHarnessCache: HarnessCaching {
             directoryURL: directoryURL,
             rawInputURL: rawInputURL,
             processedContextURL: processedContextURL,
+            providerPromptURL: providerPromptURL,
             rawOutputURL: rawOutputURL,
             metadataURL: metadataURL
         )
+    }
+
+    public func updateProviderPrompt(
+        for record: HarnessCacheRecord,
+        providerPrompt: String
+    ) async throws {
+        try FileSystemUtilities.write(providerPrompt, to: record.providerPromptURL)
     }
 
     public func updateOutput(
@@ -366,6 +377,7 @@ public actor FileSystemHarnessCache: HarnessCaching {
                 directoryURL: directoryURL,
                 rawInputURL: directoryURL.appendingPathComponent("raw-input.txt", isDirectory: false),
                 processedContextURL: directoryURL.appendingPathComponent("processed-context.md", isDirectory: false),
+                providerPromptURL: directoryURL.appendingPathComponent("provider-prompt.md", isDirectory: false),
                 rawOutputURL: directoryURL.appendingPathComponent("raw-output.txt", isDirectory: false),
                 metadataURL: metadataURL
             )

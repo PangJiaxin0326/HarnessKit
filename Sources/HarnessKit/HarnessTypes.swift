@@ -427,6 +427,7 @@ public struct HarnessCacheRecord: Sendable, Equatable, Codable {
     public var directoryURL: URL
     public var rawInputURL: URL
     public var processedContextURL: URL
+    public var providerPromptURL: URL
     public var rawOutputURL: URL
     public var metadataURL: URL
 
@@ -435,6 +436,7 @@ public struct HarnessCacheRecord: Sendable, Equatable, Codable {
         directoryURL: URL,
         rawInputURL: URL,
         processedContextURL: URL,
+        providerPromptURL: URL,
         rawOutputURL: URL,
         metadataURL: URL
     ) {
@@ -442,6 +444,7 @@ public struct HarnessCacheRecord: Sendable, Equatable, Codable {
         self.directoryURL = directoryURL
         self.rawInputURL = rawInputURL
         self.processedContextURL = processedContextURL
+        self.providerPromptURL = providerPromptURL
         self.rawOutputURL = rawOutputURL
         self.metadataURL = metadataURL
     }
@@ -644,8 +647,14 @@ public protocol HarnessCaching: Sendable {
     func createRecord(
         rawInput: String,
         processedContext: String,
+        providerPrompt: String,
         metadata: HarnessCacheMetadata
     ) async throws -> HarnessCacheRecord
+
+    func updateProviderPrompt(
+        for record: HarnessCacheRecord,
+        providerPrompt: String
+    ) async throws
 
     func updateOutput(
         for record: HarnessCacheRecord,
