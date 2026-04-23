@@ -182,7 +182,10 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
           </tool_call>
         - Request one tool at a time.
         - Do not wrap the tool call block in Markdown code fences.
-        - After the harness returns a tool result, either request another tool with the same format or answer the user directly.
+        - After the harness returns a tool result, either request another tool with the same format or respond with only valid JSON in this shape:
+          {"response":"plain-text answer for the user"}
+        - The harness will attach the executed tool results to the final returned payload.
+        - Do not add extra commentary around the JSON response.
         """
 
         let prompt = """
@@ -361,20 +364,24 @@ public actor AIService {
         let input: String
     }
 
-    private struct AutomaticToolResult: Sendable {
-        let call: AutomaticToolCall
-        let output: String
-        let wasSuccessful: Bool
-    }
-
     private enum StreamPassOutcome: Sendable {
         case final(String)
         case toolCall(AutomaticToolCall)
     }
 
+    private struct StreamLoopResult: Sendable {
+        let output: String
+        let shouldEmitCompletedOutput: Bool
+    }
+
+    private struct StructuredToolResponse: Sendable, Decodable {
+        let response: String
+    }
+
     private static let automaticToolCallStartTag = "<tool_call>"
     private static let automaticToolCallEndTag = "</tool_call>"
     private static let maximumAutomaticToolRoundTrips = 8
+    private static let maximumStructuredToolResponseRepairAttempts = 2
 
     private let configuration: Configuration
     private let toolRegistry: HarnessToolRegistry
@@ -532,9 +539,9 @@ public actor AIService {
 
         let worker = Task {
             do {
-                let output = try await runStreamLoop(for: execution, continuation: continuation)
-                let finalizedOutput = try await finalize(output: output, execution: execution)
-                if output.isEmpty {
+                let result = try await runStreamLoop(for: execution, continuation: continuation)
+                let finalizedOutput = try await finalize(output: result.output, execution: execution)
+                if result.shouldEmitCompletedOutput {
                     continuation.yield(Generation(kind: .completed, text: finalizedOutput))
                 }
                 continuation.finish()
@@ -561,7 +568,7 @@ public actor AIService {
             switch harnessError {
             case .permissionDenied, .governanceBlocked:
                 return
-            case .missingTool, .invalidSkillFile, .invalidSubagent, .missingSubagent:
+            case .missingTool, .invalidToolResponse, .invalidSkillFile, .invalidSubagent, .missingSubagent:
                 break
             }
         }
@@ -611,7 +618,6 @@ public actor AIService {
         let cacheRecord = try await cache.createRecord(
             rawInput: input,
             processedContext: context.rendered,
-            providerPrompt: plan.prompt,
             metadata: metadata
         )
         await configuration.observer.record(.init(kind: .cached, message: "Saved harness cache '\(metadata.id.uuidString)'."))
@@ -692,21 +698,40 @@ public actor AIService {
     }
 
     private func runGenerateLoop(for execution: PreparedExecution) async throws -> String {
-        var request = execution.request
-        var toolRoundTripCount = 0
+        try await runGenerateLoop(
+            startingWith: execution.request,
+            initialToolResults: []
+        )
+    }
+
+    private func runGenerateLoop(
+        startingWith initialRequest: AIModelRequest,
+        initialToolResults: [HarnessToolInvocationResult]
+    ) async throws -> String {
+        var request = initialRequest
+        var toolResults = initialToolResults
+        var toolRoundTripCount = initialToolResults.count
 
         while true {
             try Task.checkCancellation()
-            try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
 
             let output = try await configuration.backend.provider.generate(request)
             guard let toolCall = automaticToolCall(in: output) else {
-                return output
+                guard !toolResults.isEmpty else {
+                    return output
+                }
+
+                return try await finalizeStructuredToolResponse(
+                    initialOutput: output,
+                    request: request,
+                    toolResults: toolResults
+                )
             }
 
             toolRoundTripCount += 1
             let canRequestMoreTools = toolRoundTripCount < Self.maximumAutomaticToolRoundTrips
             let toolResult = await invokeAutomaticTool(toolCall)
+            toolResults.append(toolResult)
             request = requestByAppendingToolResult(
                 toolResult,
                 to: request,
@@ -715,9 +740,12 @@ public actor AIService {
             )
 
             if !canRequestMoreTools {
-                try Task.checkCancellation()
-                try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
-                return try await configuration.backend.provider.generate(request)
+                let output = try await configuration.backend.provider.generate(request)
+                return try await finalizeStructuredToolResponse(
+                    initialOutput: output,
+                    request: request,
+                    toolResults: toolResults
+                )
             }
         }
     }
@@ -725,60 +753,29 @@ public actor AIService {
     private func runStreamLoop(
         for execution: PreparedExecution,
         continuation: AsyncThrowingStream<Generation, Error>.Continuation
-    ) async throws -> String {
-        var request = execution.request
-        var toolRoundTripCount = 0
+    ) async throws -> StreamLoopResult {
+        try Task.checkCancellation()
 
-        while true {
-            try Task.checkCancellation()
-            try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
-
-            let outcome = try await collectProviderStream(for: request, continuation: continuation)
-            switch outcome {
-            case .final(let output):
-                return output
-            case .toolCall(let toolCall):
-                toolRoundTripCount += 1
-                let canRequestMoreTools = toolRoundTripCount < Self.maximumAutomaticToolRoundTrips
-                let toolResult = await invokeAutomaticTool(toolCall)
-                request = requestByAppendingToolResult(
+        let outcome = try await collectProviderStream(for: execution.request, continuation: continuation)
+        switch outcome {
+        case .final(let output):
+            return StreamLoopResult(
+                output: output,
+                shouldEmitCompletedOutput: output.isEmpty
+            )
+        case .toolCall(let toolCall):
+            let toolResult = await invokeAutomaticTool(toolCall)
+            let output = try await runGenerateLoop(
+                startingWith: requestByAppendingToolResult(
                     toolResult,
-                    to: request,
-                    roundTrip: toolRoundTripCount,
-                    canRequestMoreTools: canRequestMoreTools
-                )
-
-                if !canRequestMoreTools {
-                    try Task.checkCancellation()
-                    try await cache.updateProviderPrompt(for: execution.cacheRecord, providerPrompt: request.prompt)
-                    return try await streamFinalAnswer(for: request, continuation: continuation)
-                }
-            }
+                    to: execution.request,
+                    roundTrip: 1,
+                    canRequestMoreTools: 1 < Self.maximumAutomaticToolRoundTrips
+                ),
+                initialToolResults: [toolResult]
+            )
+            return StreamLoopResult(output: output, shouldEmitCompletedOutput: true)
         }
-    }
-
-    private func streamFinalAnswer(
-        for request: AIModelRequest,
-        continuation: AsyncThrowingStream<Generation, Error>.Continuation
-    ) async throws -> String {
-        var output = ""
-
-        for try await generation in configuration.backend.provider.stream(request) {
-            switch generation.kind {
-            case .delta:
-                output += generation.text
-            case .completed:
-                if output.isEmpty {
-                    output = generation.text
-                }
-            case .metadata:
-                break
-            }
-
-            continuation.yield(generation)
-        }
-
-        return output
     }
 
     private func collectProviderStream(
@@ -826,17 +823,27 @@ public actor AIService {
         return .final(output)
     }
 
-    private func invokeAutomaticTool(_ toolCall: AutomaticToolCall) async -> AutomaticToolResult {
+    private func invokeAutomaticTool(_ toolCall: AutomaticToolCall) async -> HarnessToolInvocationResult {
         do {
             let output = try await toolRegistry.invoke(named: toolCall.name, input: toolCall.input)
-            return AutomaticToolResult(call: toolCall, output: output, wasSuccessful: true)
+            return HarnessToolInvocationResult(
+                name: toolCall.name,
+                input: toolCall.input,
+                output: output,
+                status: .success
+            )
         } catch {
-            return AutomaticToolResult(call: toolCall, output: error.localizedDescription, wasSuccessful: false)
+            return HarnessToolInvocationResult(
+                name: toolCall.name,
+                input: toolCall.input,
+                output: error.localizedDescription,
+                status: .failure
+            )
         }
     }
 
     private func requestByAppendingToolResult(
-        _ toolResult: AutomaticToolResult,
+        _ toolResult: HarnessToolInvocationResult,
         to request: AIModelRequest,
         roundTrip: Int,
         canRequestMoreTools: Bool
@@ -845,27 +852,98 @@ public actor AIService {
         let nextStepInstructions = canRequestMoreTools
             ? """
             - If another registered tool is needed, respond with only a new `<tool_call>` block.
-            - Otherwise answer the user directly.
+            - Otherwise respond with only valid JSON matching `{"response":"plain-text answer for the user"}`.
             """
-            : "- The harness will not run more tools in this turn, so answer the user directly with the information you already have."
+            : """
+            - The harness will not run more tools in this turn.
+            - Respond with only valid JSON matching `{"response":"plain-text answer for the user"}`.
+            """
 
         updatedRequest.prompt += """
 
         Harness Tool Round Trip \(roundTrip)
-        Requested Tool
-        - Name: \(toolResult.call.name)
-        - Status: \(toolResult.wasSuccessful ? "success" : "failure")
-
-        Tool Input
-        \(toolResult.call.input)
-
-        Tool Result
-        \(toolResult.output)
+        Tool Result JSON
+        \(jsonString(for: toolResult))
 
         Next Step
         \(nextStepInstructions)
         """
         return updatedRequest
+    }
+
+    private func finalizeStructuredToolResponse(
+        initialOutput: String,
+        request initialRequest: AIModelRequest,
+        toolResults: [HarnessToolInvocationResult]
+    ) async throws -> String {
+        var output = initialOutput
+        var request = initialRequest
+        var repairAttempt = 0
+
+        while true {
+            try Task.checkCancellation()
+
+            if let structuredResponse = structuredToolResponse(in: output) {
+                return jsonString(for: HarnessToolResponseEnvelope(
+                    response: structuredResponse.response,
+                    toolResults: toolResults
+                ))
+            }
+
+            guard repairAttempt < Self.maximumStructuredToolResponseRepairAttempts else {
+                throw HarnessError.invalidToolResponse(output)
+            }
+
+            repairAttempt += 1
+            request = requestByAppendingStructuredToolResponseRepair(
+                invalidOutput: output,
+                to: request,
+                attempt: repairAttempt
+            )
+            output = try await configuration.backend.provider.generate(request)
+        }
+    }
+
+    private func structuredToolResponse(in output: String) -> StructuredToolResponse? {
+        let normalizedOutput = strippedEnclosingCodeFence(from: output)
+        guard let data = normalizedOutput.data(using: .utf8) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(StructuredToolResponse.self, from: data)
+    }
+
+    private func requestByAppendingStructuredToolResponseRepair(
+        invalidOutput: String,
+        to request: AIModelRequest,
+        attempt: Int
+    ) -> AIModelRequest {
+        var updatedRequest = request
+        updatedRequest.prompt += """
+
+        Structured Tool Response Repair \(attempt)
+        The previous reply was invalid. Respond again with only valid JSON matching:
+        {"response":"plain-text answer for the user"}
+        Do not request another tool and do not add extra commentary outside the JSON.
+
+        Previous Invalid Reply
+        \(invalidOutput)
+        """
+        return updatedRequest
+    }
+
+    private func jsonString<Value: Encodable>(for value: Value) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        guard
+            let data = try? encoder.encode(value),
+            let string = String(data: data, encoding: .utf8)
+        else {
+            return "{}"
+        }
+
+        return string
     }
 
     private func automaticToolCall(in output: String) -> AutomaticToolCall? {

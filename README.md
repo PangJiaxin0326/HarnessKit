@@ -33,7 +33,6 @@ The harness work happens behind that interface. Developers configure tools, skil
 - A filesystem-backed cache that stores:
   - raw input
   - processed context
-  - the provider prompt
   - raw model output
   - metadata
 - A filesystem-backed subagent model under `agents/`
@@ -108,11 +107,12 @@ The default harness will:
 3. Load skill headers referenced by `AGENTS.md`
 4. Load memory files from the configured memory directory
 5. Build processed context
-6. Store raw input, processed context, and the provider prompt in the on-disk cache
+6. Store raw input and processed context in the on-disk cache
 7. Call the configured provider
 8. Automatically round-trip through registered tools when the model emits a `<tool_call>` request
-9. Store the raw output in the cache
-10. Return to `idle` after successful completion, or move into `waiting` when the harness needs more caller action
+9. Validate tool-assisted completions as structured JSON and retry if the provider returns invalid JSON
+10. Store the raw output in the cache
+11. Return to `idle` after successful completion, or move into `waiting` when the harness needs more caller action
 
 If you want the compact `String -> String` mental model, you can also use:
 
@@ -166,7 +166,23 @@ When tools are registered, the default workflow also teaches the model a small t
 </tool_call>
 ```
 
-`AIService` will invoke the tool, append the result to the provider prompt, and continue until the model returns a normal answer.
+`AIService` will invoke the tool, continue the round trip automatically, and if a tool was used it will return a JSON string decodable as `HarnessToolResponseEnvelope`:
+
+```json
+{
+  "response": "Summary for the user.",
+  "toolResults": [
+    {
+      "name": "read-file",
+      "input": "README.md",
+      "output": "# HarnessKit",
+      "status": "success"
+    }
+  ]
+}
+```
+
+If the model returns invalid JSON after a tool round trip, the harness automatically retries with a repair prompt before failing the request.
 
 ### Skills
 
@@ -229,12 +245,11 @@ Each harness run creates a cache directory under `.harness-cache/<uuid>/` contai
 ```text
 raw-input.txt
 processed-context.md
-provider-prompt.md
 raw-output.txt
 metadata.json
 ```
 
-This is intended to preserve the raw text, the processed context, and the latest provider prompt that was actually sent during the run.
+This is intended to preserve the raw text, the processed context, and the final returned payload.
 
 ## Subagents
 
