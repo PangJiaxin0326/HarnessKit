@@ -4,6 +4,7 @@ public enum HarnessError: Error, Sendable {
     case permissionDenied(String)
     case governanceBlocked(String)
     case missingTool(String)
+    case invalidToolResponse(String)
     case invalidSkillFile(URL)
     case invalidSubagent(String)
     case missingSubagent(String)
@@ -18,6 +19,8 @@ extension HarnessError: LocalizedError {
             "Harness governance blocked completion: \(message)"
         case .missingTool(let name):
             "No tool named '\(name)' is registered."
+        case .invalidToolResponse(let output):
+            "The model returned an invalid structured tool response: \(output)"
         case .invalidSkillFile(let url):
             "The skill file at \(url.path) could not be parsed."
         case .invalidSubagent(let message):
@@ -65,6 +68,40 @@ public struct HarnessToolDescriptor: Sendable, Equatable, Codable {
     public init(name: String, description: String) {
         self.name = name
         self.description = description
+    }
+}
+
+public struct HarnessToolInvocationResult: Sendable, Equatable, Codable {
+    public enum Status: String, Sendable, Codable {
+        case success
+        case failure
+    }
+
+    public var name: String
+    public var input: String
+    public var output: String
+    public var status: Status
+
+    public init(
+        name: String,
+        input: String,
+        output: String,
+        status: Status
+    ) {
+        self.name = name
+        self.input = input
+        self.output = output
+        self.status = status
+    }
+}
+
+public struct HarnessToolResponseEnvelope: Sendable, Equatable, Codable {
+    public var response: String
+    public var toolResults: [HarnessToolInvocationResult]
+
+    public init(response: String, toolResults: [HarnessToolInvocationResult]) {
+        self.response = response
+        self.toolResults = toolResults
     }
 }
 
@@ -427,7 +464,6 @@ public struct HarnessCacheRecord: Sendable, Equatable, Codable {
     public var directoryURL: URL
     public var rawInputURL: URL
     public var processedContextURL: URL
-    public var providerPromptURL: URL
     public var rawOutputURL: URL
     public var metadataURL: URL
 
@@ -436,7 +472,6 @@ public struct HarnessCacheRecord: Sendable, Equatable, Codable {
         directoryURL: URL,
         rawInputURL: URL,
         processedContextURL: URL,
-        providerPromptURL: URL,
         rawOutputURL: URL,
         metadataURL: URL
     ) {
@@ -444,7 +479,6 @@ public struct HarnessCacheRecord: Sendable, Equatable, Codable {
         self.directoryURL = directoryURL
         self.rawInputURL = rawInputURL
         self.processedContextURL = processedContextURL
-        self.providerPromptURL = providerPromptURL
         self.rawOutputURL = rawOutputURL
         self.metadataURL = metadataURL
     }
@@ -647,14 +681,8 @@ public protocol HarnessCaching: Sendable {
     func createRecord(
         rawInput: String,
         processedContext: String,
-        providerPrompt: String,
         metadata: HarnessCacheMetadata
     ) async throws -> HarnessCacheRecord
-
-    func updateProviderPrompt(
-        for record: HarnessCacheRecord,
-        providerPrompt: String
-    ) async throws
 
     func updateOutput(
         for record: HarnessCacheRecord,
