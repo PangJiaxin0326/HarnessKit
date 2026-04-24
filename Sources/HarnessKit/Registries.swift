@@ -55,7 +55,10 @@ public actor HarnessSkillRegistry {
             inAgentsFile: workspace.agentsFileURL,
             relativeTo: workspace.rootURL
         )
-        let allURLs = registeredURLs.union(agentURLs.map(\.standardizedFileURL))
+        let agentSkillURLs = agentURLs.filter {
+            FileSystemUtilities.isDescendant($0, of: workspace.skillsDirectoryURL)
+        }
+        let allURLs = registeredURLs.union(agentSkillURLs.map(\.standardizedFileURL))
         var refreshedHeaders: [URL: HarnessSkillHeader] = [:]
 
         for url in allURLs {

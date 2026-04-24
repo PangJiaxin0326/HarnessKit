@@ -109,7 +109,7 @@ public struct HarnessTool: Sendable {
     public typealias Handler = @Sendable (String) async throws -> String
 
     public let descriptor: HarnessToolDescriptor
-    let handler: Handler
+    private let handler: Handler
 
     public init(name: String, description: String, handler: @escaping Handler) {
         self.descriptor = HarnessToolDescriptor(name: name, description: description)
@@ -121,6 +121,29 @@ public struct HarnessTool: Sendable {
 
     func invoke(_ input: String) async throws -> String {
         try await handler(input)
+    }
+}
+
+private enum AIModelStreamFactory {
+    static func stream(
+        generate: @escaping @Sendable () async throws -> String
+    ) -> AsyncThrowingStream<Generation, Error> {
+        let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
+        let worker = Task {
+            do {
+                let output = try await generate()
+                continuation.yield(Generation(kind: .completed, text: output))
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+
+        continuation.onTermination = { _ in
+            worker.cancel()
+        }
+
+        return stream
     }
 }
 
@@ -145,6 +168,18 @@ public struct HarnessSkillDocument: Sendable, Equatable, Codable {
     public init(header: HarnessSkillHeader, body: String) {
         self.header = header
         self.body = body
+    }
+}
+
+public struct HarnessReferenceDocument: Sendable, Equatable, Codable {
+    public var url: URL
+    public var title: String
+    public var contents: String
+
+    public init(url: URL, title: String, contents: String) {
+        self.url = url
+        self.title = title
+        self.contents = contents
     }
 }
 
@@ -283,6 +318,18 @@ public struct HarnessPermissionDecision: Sendable, Equatable, Codable {
     public init(isAllowed: Bool, reason: String? = nil) {
         self.isAllowed = isAllowed
         self.reason = reason
+    }
+}
+
+public struct HarnessToolInvocationRequest: Sendable, Equatable, Codable {
+    public var name: String
+    public var input: String
+    public var roundTrip: Int
+
+    public init(name: String, input: String, roundTrip: Int) {
+        self.name = name
+        self.input = input
+        self.roundTrip = roundTrip
     }
 }
 
@@ -489,15 +536,28 @@ public struct HarnessEnvironmentSnapshot: Sendable, Equatable, Codable {
     public var providerKind: AIProviderKind
     public var toolDescriptors: [HarnessToolDescriptor]
     public var skills: [HarnessSkillHeader]
+    public var referenceDocuments: [HarnessReferenceDocument]
     public var memoryFiles: [HarnessMemoryFile]
     public var subagents: [HarnessSubagentRecord]
     public var agentsFileText: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case workspace
+        case providerKind
+        case toolDescriptors
+        case skills
+        case referenceDocuments
+        case memoryFiles
+        case subagents
+        case agentsFileText
+    }
 
     public init(
         workspace: HarnessWorkspace,
         providerKind: AIProviderKind,
         toolDescriptors: [HarnessToolDescriptor],
         skills: [HarnessSkillHeader],
+        referenceDocuments: [HarnessReferenceDocument] = [],
         memoryFiles: [HarnessMemoryFile],
         subagents: [HarnessSubagentRecord],
         agentsFileText: String?
@@ -506,9 +566,34 @@ public struct HarnessEnvironmentSnapshot: Sendable, Equatable, Codable {
         self.providerKind = providerKind
         self.toolDescriptors = toolDescriptors
         self.skills = skills
+        self.referenceDocuments = referenceDocuments
         self.memoryFiles = memoryFiles
         self.subagents = subagents
         self.agentsFileText = agentsFileText
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.workspace = try container.decode(HarnessWorkspace.self, forKey: .workspace)
+        self.providerKind = try container.decode(AIProviderKind.self, forKey: .providerKind)
+        self.toolDescriptors = try container.decode([HarnessToolDescriptor].self, forKey: .toolDescriptors)
+        self.skills = try container.decode([HarnessSkillHeader].self, forKey: .skills)
+        self.referenceDocuments = try container.decodeIfPresent([HarnessReferenceDocument].self, forKey: .referenceDocuments) ?? []
+        self.memoryFiles = try container.decode([HarnessMemoryFile].self, forKey: .memoryFiles)
+        self.subagents = try container.decode([HarnessSubagentRecord].self, forKey: .subagents)
+        self.agentsFileText = try container.decodeIfPresent(String.self, forKey: .agentsFileText)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(workspace, forKey: .workspace)
+        try container.encode(providerKind, forKey: .providerKind)
+        try container.encode(toolDescriptors, forKey: .toolDescriptors)
+        try container.encode(skills, forKey: .skills)
+        try container.encode(referenceDocuments, forKey: .referenceDocuments)
+        try container.encode(memoryFiles, forKey: .memoryFiles)
+        try container.encode(subagents, forKey: .subagents)
+        try container.encodeIfPresent(agentsFileText, forKey: .agentsFileText)
     }
 }
 
@@ -519,22 +604,9 @@ public protocol AIModelProviding: Sendable {
 
 extension AIModelProviding {
     public func stream(_ request: AIModelRequest) -> AsyncThrowingStream<Generation, Error> {
-        let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
-        let worker = Task {
-            do {
-                let output = try await generate(request)
-                continuation.yield(Generation(kind: .completed, text: output))
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
-            }
+        AIModelStreamFactory.stream {
+            try await generate(request)
         }
-
-        continuation.onTermination = { _ in
-            worker.cancel()
-        }
-
-        return stream
     }
 }
 
@@ -565,22 +637,9 @@ public struct ClosureAIModelProvider: AIModelProviding {
             return streamHandler(request)
         }
 
-        let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
-        let worker = Task {
-            do {
-                let output = try await generateHandler(request)
-                continuation.yield(Generation(kind: .completed, text: output))
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
-            }
+        return AIModelStreamFactory.stream {
+            try await generateHandler(request)
         }
-
-        continuation.onTermination = { _ in
-            worker.cancel()
-        }
-
-        return stream
     }
 }
 
@@ -636,6 +695,14 @@ public protocol HarnessContextBuilding: Sendable {
 
 public protocol HarnessPermissionChecking: Sendable {
     func authorize(
+        plan: HarnessPlan,
+        environment: HarnessEnvironmentSnapshot
+    ) async throws -> HarnessPermissionDecision
+}
+
+public protocol HarnessToolPermissionChecking: HarnessPermissionChecking {
+    func authorizeToolInvocation(
+        _ invocation: HarnessToolInvocationRequest,
         plan: HarnessPlan,
         environment: HarnessEnvironmentSnapshot
     ) async throws -> HarnessPermissionDecision
