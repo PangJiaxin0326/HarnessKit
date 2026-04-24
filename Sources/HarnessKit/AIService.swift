@@ -5,7 +5,7 @@ public enum AIServiceBackend: Sendable {
     case appleIntelligence(any AppleIntelligenceProviding)
     case custom(any AIModelProviding)
 
-    var kind: AIProviderKind {
+    fileprivate var kind: AIProviderKind {
         switch self {
         case .api:
             .api
@@ -16,7 +16,7 @@ public enum AIServiceBackend: Sendable {
         }
     }
 
-    var provider: any AIModelProviding {
+    fileprivate var provider: any AIModelProviding {
         switch self {
         case .api(let provider):
             provider
@@ -25,6 +25,47 @@ public enum AIServiceBackend: Sendable {
         case .custom(let provider):
             provider
         }
+    }
+}
+
+private enum HarnessPromptFormatting {
+    static func list(_ items: [String], fallback: String) -> String {
+        guard !items.isEmpty else {
+            return fallback
+        }
+
+        return items.map { "- \($0)" }.joined(separator: "\n")
+    }
+
+    static func toolList(_ tools: [HarnessToolDescriptor], emptyMessage: String) -> String {
+        list(
+            tools.map { "\($0.name): \($0.description)" },
+            fallback: emptyMessage
+        )
+    }
+
+    static func skillList(_ skills: [HarnessSkillHeader], emptyMessage: String) -> String {
+        list(
+            skills.map { skill in
+                let toolText = skill.tools.isEmpty ? "none" : skill.tools.joined(separator: ", ")
+                return "\(skill.name): \(skill.description) [tools: \(toolText)]"
+            },
+            fallback: emptyMessage
+        )
+    }
+
+    static func referenceList(_ documents: [HarnessReferenceDocument], emptyMessage: String) -> String {
+        list(
+            documents.map { "\($0.title): \($0.url.path)" },
+            fallback: emptyMessage
+        )
+    }
+
+    static func memoryList(_ memoryFiles: [HarnessMemoryFile], emptyMessage: String) -> String {
+        list(
+            memoryFiles.map(\.url.path),
+            fallback: emptyMessage
+        )
     }
 }
 
@@ -56,10 +97,10 @@ public struct DefaultContextBuilder: HarnessContextBuilding {
                 Goal: \(intent.goal)
 
                 Acceptance Criteria:
-                \(formatList(intent.acceptanceCriteria, fallback: "- None supplied."))
+                \(HarnessPromptFormatting.list(intent.acceptanceCriteria, fallback: "- None supplied."))
 
                 Constraints:
-                \(formatList(intent.constraints, fallback: "- None supplied."))
+                \(HarnessPromptFormatting.list(intent.constraints, fallback: "- None supplied."))
                 """
             )
         ]
@@ -77,9 +118,10 @@ public struct DefaultContextBuilder: HarnessContextBuilding {
             fragments.append(.init(
                 kind: .tool,
                 title: "Registered Tools",
-                body: environment.toolDescriptors
-                    .map { "- \($0.name): \($0.description)" }
-                    .joined(separator: "\n")
+                body: HarnessPromptFormatting.toolList(
+                    environment.toolDescriptors,
+                    emptyMessage: "- No registered tools."
+                )
             ))
         }
 
@@ -92,6 +134,15 @@ public struct DefaultContextBuilder: HarnessContextBuilding {
                 Tools: \(skill.tools.isEmpty ? "None" : skill.tools.joined(separator: ", "))
                 """,
                 sourceURL: skill.fileURL
+            )
+        })
+
+        fragments.append(contentsOf: environment.referenceDocuments.map { document in
+            HarnessContext.Fragment(
+                kind: .custom,
+                title: "Reference: \(document.title)",
+                body: document.contents,
+                sourceURL: document.url
             )
         })
 
@@ -127,14 +178,6 @@ public struct DefaultContextBuilder: HarnessContextBuilding {
 
         return HarnessContext(fragments: fragments)
     }
-
-    private func formatList(_ items: [String], fallback: String) -> String {
-        if items.isEmpty {
-            return fallback
-        }
-
-        return items.map { "- \($0)" }.joined(separator: "\n")
-    }
 }
 
 public struct AllowAllPermissionChecker: HarnessPermissionChecking {
@@ -158,20 +201,22 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
         context: HarnessContext,
         environment: HarnessEnvironmentSnapshot
     ) async throws -> HarnessPlan {
-        let toolLines = environment.toolDescriptors.isEmpty
-            ? "- No registered tools."
-            : environment.toolDescriptors.map { "- \($0.name): \($0.description)" }.joined(separator: "\n")
-
-        let skillLines = environment.skills.isEmpty
-            ? "- No exposed skills."
-            : environment.skills.map { skill in
-                let toolText = skill.tools.isEmpty ? "none" : skill.tools.joined(separator: ", ")
-                return "- \(skill.name): \(skill.description) [tools: \(toolText)]"
-            }.joined(separator: "\n")
-
-        let memoryLines = environment.memoryFiles.isEmpty
-            ? "- No memory files."
-            : environment.memoryFiles.map { "- \($0.url.path)" }.joined(separator: "\n")
+        let toolLines = HarnessPromptFormatting.toolList(
+            environment.toolDescriptors,
+            emptyMessage: "- No registered tools."
+        )
+        let skillLines = HarnessPromptFormatting.skillList(
+            environment.skills,
+            emptyMessage: "- No exposed skills."
+        )
+        let referenceLines = HarnessPromptFormatting.referenceList(
+            environment.referenceDocuments,
+            emptyMessage: "- No referenced documents."
+        )
+        let memoryLines = HarnessPromptFormatting.memoryList(
+            environment.memoryFiles,
+            emptyMessage: "- No memory files."
+        )
 
         let toolCallInstructions = environment.toolDescriptors.isEmpty ? "" : """
 
@@ -195,10 +240,10 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
         \(intent.goal)
 
         Acceptance Criteria
-        \(formatList(intent.acceptanceCriteria, fallback: "- Produce a useful answer."))
+        \(HarnessPromptFormatting.list(intent.acceptanceCriteria, fallback: "- Produce a useful answer."))
 
         Constraints
-        \(formatList(intent.constraints, fallback: "- Respect the current harness configuration."))
+        \(HarnessPromptFormatting.list(intent.constraints, fallback: "- Respect the current harness configuration."))
 
         Registered Tools
         \(toolLines)
@@ -206,6 +251,9 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
 
         Skill Headers
         \(skillLines)
+
+        Reference Documents
+        \(referenceLines)
 
         Memory Files
         \(memoryLines)
@@ -226,14 +274,6 @@ public struct DefaultHarnessWorkflow: HarnessWorkflowBuilding {
             memoryFileURLs: environment.memoryFiles.map(\.url),
             prompt: prompt
         )
-    }
-
-    private func formatList(_ items: [String], fallback: String) -> String {
-        if items.isEmpty {
-            return fallback
-        }
-
-        return items.map { "- \($0)" }.joined(separator: "\n")
     }
 }
 
@@ -390,6 +430,11 @@ public actor AIService {
     private let memoryStore: any HarnessMemoryStoring
     private let subagentManager: any HarnessSubagentManaging
     private var statusValue: HarnessStatus = .idle
+    private var activeExecutionCount = 0
+    private var governanceWaitCount = 0
+    private var pendingSubagentWaitIDs: Set<String> = []
+    private var subagentWaitGenerations: [String: Int] = [:]
+    private var nextSubagentWaitGeneration = 0
 
     public init(configuration: Configuration) throws {
         try FileSystemUtilities.prepareWorkspace(configuration.workspace)
@@ -406,7 +451,14 @@ public actor AIService {
     }
 
     public func acknowledgeWaitState() {
-        statusValue = .idle
+        if governanceWaitCount > 0 {
+            governanceWaitCount -= 1
+            updateStatusValue()
+        } else if let subagentID = pendingSubagentWaitIDs.first {
+            setSubagentWait(id: subagentID, isWaiting: false)
+        } else {
+            updateStatusValue()
+        }
     }
 
     public func registerTool(_ tool: HarnessTool) async {
@@ -464,7 +516,7 @@ public actor AIService {
 
     public func markSubagentNeedsMoreContext(id: String, request: String) async throws {
         try await subagentManager.markNeedsMoreContext(for: id, request: request)
-        statusValue = .waiting
+        try await reconcileSubagentWaitState(for: id)
         await configuration.observer.record(.init(kind: .waiting, message: "Subagent '\(id)' requested more context."))
     }
 
@@ -475,41 +527,58 @@ public actor AIService {
     }
 
     public func satisfyPendingSubagentRequests() async throws -> [HarnessSubagentRecord] {
-        statusValue = .working
-        let snapshot = try await environmentSnapshot()
-        let currentSubagents = try await subagentManager.listSubagents()
-        var resolved: [HarnessSubagentRecord] = []
+        beginExecution()
+        defer { finishExecution(with: .idle) }
+        var reconciliationIDs: Set<String> = []
 
-        for subagent in currentSubagents where subagent.input.needsMoreContext {
-            let prompt = subagent.input.contextRequest.isEmpty ? subagent.input.task : subagent.input.contextRequest
-            let intent = HarnessIntent(
-                goal: prompt,
-                acceptanceCriteria: ["Provide the requested subagent context."],
-                constraints: ["Use only the current harness environment."]
-            )
+        do {
+            let snapshot = try await environmentSnapshot()
+            let currentSubagents = try await subagentManager.listSubagents()
+            let pendingSubagents = currentSubagents.filter(\.input.needsMoreContext)
+            reconciliationIDs = Set(pendingSubagents.map(\.id))
+            var resolved: [HarnessSubagentRecord] = []
 
-            do {
-                let context = try await configuration.contextBuilder.buildContext(
-                    for: prompt,
-                    intent: intent,
-                    environment: snapshot
+            for subagent in pendingSubagents {
+                try Task.checkCancellation()
+
+                let prompt = subagent.input.contextRequest.isEmpty ? subagent.input.task : subagent.input.contextRequest
+                let intent = HarnessIntent(
+                    goal: prompt,
+                    acceptanceCriteria: ["Provide the requested subagent context."],
+                    constraints: ["Use only the current harness environment."]
                 )
-                let resolvedRecord = try await subagentManager.satisfyContextRequest(
-                    for: subagent.id,
-                    context: context.rendered.isEmpty ? "No matching context was available." : context.rendered
-                )
-                resolved.append(resolvedRecord)
-            } catch {
-                let rejectedRecord = try await subagentManager.rejectContextRequest(
-                    for: subagent.id,
-                    reason: error.localizedDescription
-                )
-                resolved.append(rejectedRecord)
+
+                do {
+                    let context = try await configuration.contextBuilder.buildContext(
+                        for: prompt,
+                        intent: intent,
+                        environment: snapshot
+                    )
+                    let resolvedRecord = try await subagentManager.satisfyContextRequest(
+                        for: subagent.id,
+                        context: context.rendered.isEmpty ? "No matching context was available." : context.rendered
+                    )
+                    resolved.append(resolvedRecord)
+                    try await reconcileSubagentWaitState(for: subagent.id)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    let rejectedRecord = try await subagentManager.rejectContextRequest(
+                        for: subagent.id,
+                        reason: error.localizedDescription
+                    )
+                    resolved.append(rejectedRecord)
+                    try await reconcileSubagentWaitState(for: subagent.id)
+                }
             }
-        }
 
-        statusValue = resolved.isEmpty ? .idle : .waiting
-        return resolved
+            return resolved
+        } catch {
+            for subagentID in reconciliationIDs {
+                try? await reconcileSubagentWaitState(for: subagentID)
+            }
+            throw error
+        }
     }
 
     public func callAsFunction(_ input: String) async throws -> String {
@@ -558,27 +627,95 @@ public actor AIService {
         return stream
     }
 
+    private func beginExecution() {
+        activeExecutionCount += 1
+        updateStatusValue()
+    }
+
+    private func finishExecution(with status: HarnessStatus) {
+        if activeExecutionCount > 0 {
+            activeExecutionCount -= 1
+        }
+        if status == .waiting {
+            governanceWaitCount += 1
+        }
+        updateStatusValue()
+    }
+
+    private func reconcileSubagentWaitState(for id: String) async throws {
+        let generation = beginSubagentWaitUpdate(for: id)
+        let isWaiting = try await subagentManager.subagent(id: id)?.input.needsMoreContext == true
+        guard subagentWaitGenerations[id] == generation else {
+            return
+        }
+        applySubagentWait(id: id, isWaiting: isWaiting)
+    }
+
+    private func setSubagentWait(id: String, isWaiting: Bool) {
+        beginSubagentWaitUpdate(for: id)
+        applySubagentWait(id: id, isWaiting: isWaiting)
+    }
+
+    @discardableResult
+    private func beginSubagentWaitUpdate(for id: String) -> Int {
+        nextSubagentWaitGeneration += 1
+        subagentWaitGenerations[id] = nextSubagentWaitGeneration
+        return nextSubagentWaitGeneration
+    }
+
+    private func applySubagentWait(id: String, isWaiting: Bool) {
+        if isWaiting {
+            pendingSubagentWaitIDs.insert(id)
+        } else {
+            pendingSubagentWaitIDs.remove(id)
+        }
+        updateStatusValue()
+    }
+
+    private func updateStatusValue() {
+        if activeExecutionCount > 0 {
+            statusValue = .working
+        } else if governanceWaitCount > 0 || !pendingSubagentWaitIDs.isEmpty {
+            statusValue = .waiting
+        } else {
+            statusValue = .idle
+        }
+    }
+
     private func handleExecutionFailure(_ error: Error) async {
         if error is CancellationError {
-            statusValue = .idle
+            if activeExecutionCount > 0 {
+                finishExecution(with: .idle)
+            } else {
+                updateStatusValue()
+            }
             return
         }
 
         if let harnessError = error as? HarnessError {
             switch harnessError {
             case .permissionDenied, .governanceBlocked:
+                if activeExecutionCount > 0 {
+                    finishExecution(with: .waiting)
+                } else {
+                    updateStatusValue()
+                }
                 return
             case .missingTool, .invalidToolResponse, .invalidSkillFile, .invalidSubagent, .missingSubagent:
                 break
             }
         }
 
-        statusValue = .idle
+        if activeExecutionCount > 0 {
+            finishExecution(with: .idle)
+        } else {
+            updateStatusValue()
+        }
         await configuration.observer.record(.init(kind: .failed, message: error.localizedDescription))
     }
 
     private func prepareExecution(for input: String) async throws -> PreparedExecution {
-        statusValue = .working
+        beginExecution()
         await configuration.observer.record(.init(kind: .started, message: "Started harness execution."))
 
         let skills = try await skillRegistry.refreshFromAgentsFile()
@@ -601,7 +738,6 @@ public actor AIService {
         )
 
         guard permissionDecision.isAllowed else {
-            statusValue = .waiting
             let reason = permissionDecision.reason ?? "No reason provided."
             await configuration.observer.record(.init(kind: .waiting, message: reason))
             throw HarnessError.permissionDenied(reason)
@@ -660,15 +796,15 @@ public actor AIService {
 
         switch governanceDecision {
         case .finish:
-            statusValue = .idle
+            finishExecution(with: .idle)
             await configuration.observer.record(.init(kind: .completed, message: "Harness execution completed."))
             return output
         case .wait(let reason):
-            statusValue = .waiting
+            finishExecution(with: .waiting)
             await configuration.observer.record(.init(kind: .waiting, message: reason ?? "Waiting for caller action."))
             return output
         case .fail(let reason):
-            statusValue = .waiting
+            finishExecution(with: .waiting)
             await configuration.observer.record(.init(kind: .failed, message: reason ?? "Harness governance blocked completion."))
             throw HarnessError.governanceBlocked(reason ?? "No reason provided.")
         }
@@ -685,12 +821,18 @@ public actor AIService {
         let memoryFiles = try await memoryStore.readMemoryFiles()
         let subagents = try await subagentManager.listSubagents()
         let agentsFileText = try FileSystemUtilities.readTextIfPresent(at: configuration.workspace.agentsFileURL)
+        let referencedDocuments = try FileSystemUtilities.referencedMarkdownDocuments(
+            inAgentsFile: configuration.workspace.agentsFileURL,
+            relativeTo: configuration.workspace.rootURL,
+            excluding: Set(skillHeaders.map { $0.fileURL.standardizedFileURL })
+        )
 
         return HarnessEnvironmentSnapshot(
             workspace: configuration.workspace,
             providerKind: configuration.backend.kind,
             toolDescriptors: toolDescriptors,
             skills: skillHeaders,
+            referenceDocuments: referencedDocuments,
             memoryFiles: memoryFiles,
             subagents: subagents,
             agentsFileText: agentsFileText
@@ -700,13 +842,17 @@ public actor AIService {
     private func runGenerateLoop(for execution: PreparedExecution) async throws -> String {
         try await runGenerateLoop(
             startingWith: execution.request,
-            initialToolResults: []
+            initialToolResults: [],
+            plan: execution.plan,
+            environment: execution.environment
         )
     }
 
     private func runGenerateLoop(
         startingWith initialRequest: AIModelRequest,
-        initialToolResults: [HarnessToolInvocationResult]
+        initialToolResults: [HarnessToolInvocationResult],
+        plan: HarnessPlan,
+        environment: HarnessEnvironmentSnapshot
     ) async throws -> String {
         var request = initialRequest
         var toolResults = initialToolResults
@@ -730,7 +876,12 @@ public actor AIService {
 
             toolRoundTripCount += 1
             let canRequestMoreTools = toolRoundTripCount < Self.maximumAutomaticToolRoundTrips
-            let toolResult = await invokeAutomaticTool(toolCall)
+            let toolResult = await invokeAutomaticTool(
+                toolCall,
+                roundTrip: toolRoundTripCount,
+                plan: plan,
+                environment: environment
+            )
             toolResults.append(toolResult)
             request = requestByAppendingToolResult(
                 toolResult,
@@ -764,7 +915,12 @@ public actor AIService {
                 shouldEmitCompletedOutput: output.isEmpty
             )
         case .toolCall(let toolCall):
-            let toolResult = await invokeAutomaticTool(toolCall)
+            let toolResult = await invokeAutomaticTool(
+                toolCall,
+                roundTrip: 1,
+                plan: execution.plan,
+                environment: execution.environment
+            )
             let output = try await runGenerateLoop(
                 startingWith: requestByAppendingToolResult(
                     toolResult,
@@ -772,7 +928,9 @@ public actor AIService {
                     roundTrip: 1,
                     canRequestMoreTools: 1 < Self.maximumAutomaticToolRoundTrips
                 ),
-                initialToolResults: [toolResult]
+                initialToolResults: [toolResult],
+                plan: execution.plan,
+                environment: execution.environment
             )
             return StreamLoopResult(output: output, shouldEmitCompletedOutput: true)
         }
@@ -823,8 +981,14 @@ public actor AIService {
         return .final(output)
     }
 
-    private func invokeAutomaticTool(_ toolCall: AutomaticToolCall) async -> HarnessToolInvocationResult {
+    private func invokeAutomaticTool(
+        _ toolCall: AutomaticToolCall,
+        roundTrip: Int,
+        plan: HarnessPlan,
+        environment: HarnessEnvironmentSnapshot
+    ) async -> HarnessToolInvocationResult {
         do {
+            try await authorizeAutomaticTool(toolCall, roundTrip: roundTrip, plan: plan, environment: environment)
             let output = try await toolRegistry.invoke(named: toolCall.name, input: toolCall.input)
             return HarnessToolInvocationResult(
                 name: toolCall.name,
@@ -839,6 +1003,33 @@ public actor AIService {
                 output: error.localizedDescription,
                 status: .failure
             )
+        }
+    }
+
+    private func authorizeAutomaticTool(
+        _ toolCall: AutomaticToolCall,
+        roundTrip: Int,
+        plan: HarnessPlan,
+        environment: HarnessEnvironmentSnapshot
+    ) async throws {
+        guard let toolPermissionChecker = configuration.permissionChecker as? any HarnessToolPermissionChecking else {
+            return
+        }
+
+        let invocation = HarnessToolInvocationRequest(
+            name: toolCall.name,
+            input: toolCall.input,
+            roundTrip: roundTrip
+        )
+        let decision = try await toolPermissionChecker.authorizeToolInvocation(
+            invocation,
+            plan: plan,
+            environment: environment
+        )
+
+        guard decision.isAllowed else {
+            let reason = decision.reason ?? "Tool invocation denied."
+            throw HarnessError.permissionDenied(reason)
         }
     }
 
@@ -990,8 +1181,36 @@ public actor AIService {
             return true
         }
 
+        if candidate.hasPrefix("```") {
+            return fencedOutputMayStillBecomeAutomaticToolCall(candidate)
+        }
+
         let marker = Self.automaticToolCallStartTag[...]
         return marker.hasPrefix(candidate) || candidate.hasPrefix(marker)
+    }
+
+    private func fencedOutputMayStillBecomeAutomaticToolCall(_ output: Substring) -> Bool {
+        let fence = "```"[...]
+        guard output.count > fence.count else {
+            return fence.hasPrefix(output)
+        }
+
+        guard output.hasPrefix(fence) else {
+            return false
+        }
+
+        let lines = output.components(separatedBy: .newlines)
+        guard lines.count > 1 else {
+            return true
+        }
+
+        let body = lines.dropFirst().joined(separator: "\n").drop(while: \.isWhitespace)
+        guard !body.isEmpty else {
+            return true
+        }
+
+        let marker = Self.automaticToolCallStartTag[...]
+        return marker.hasPrefix(body) || body.hasPrefix(marker)
     }
 
     private func strippedEnclosingCodeFence(from text: String) -> String {
